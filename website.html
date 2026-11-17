@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>消费者权益保护法 AI 助手</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+        #answer { border: 1px solid #ddd; padding: 15px; border-radius: 5px; min-height: 100px; background: #f9f9f9; line-height: 1.6; white-space: pre-wrap;}
+        input { width: 70%; padding: 10px; font-size: 16px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 5px;}
+    </style>
+</head>
+<body>
+    <h2>📖 消费者权益保护法 AI 助手</h2>
+    <input type="text" id="question" value="商品虚假宣传,消费者怎么办" placeholder="请输入你的问题...">
+    <button onclick="ask()">提问</button>
+    <h3>回答：</h3>
+    <div id="answer">等待提问...</div>
+
+    <script>
+        async function ask() {
+            const q = document.getElementById('question').value;
+            const answerDiv = document.getElementById('answer');
+            answerDiv.innerText = "正在检索法条并思考中...";
+
+            // 注意这里的 URL，如果是 FastAPI 托管，写相对路径 '/chat_stream' 即可
+            const response = await fetch('http://127.0.0.1:8000/chat_stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question: q })
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            answerDiv.innerText = ""; 
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const text = decoder.decode(value, { stream: true });
+                answerDiv.innerText += text;
+            }
+        }
+    </script>
+</body>
+</html>
