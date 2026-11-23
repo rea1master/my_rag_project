@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <title>消费者权益保护法 AI 助手</title>
@@ -8,39 +8,217 @@
         #answer { border: 1px solid #ddd; padding: 15px; border-radius: 5px; min-height: 100px; background: #f9f9f9; line-height: 1.6; white-space: pre-wrap;}
         input { width: 70%; padding: 10px; font-size: 16px; }
         button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 5px;}
+        button:disabled { background: #9bbfe0; cursor: not-allowed; }
+        #stop { background: #6c757d; }
+        #status { color: #666; font-size: 14px; min-height: 20px; margin: 6px 0 10px; white-space: pre-wrap; }
+        #status.error { color: #c0392b; }
     </style>
 </head>
 <body>
     <h2>📖 消费者权益保护法 AI 助手</h2>
     <input type="text" id="question" value="商品虚假宣传,消费者怎么办" placeholder="请输入你的问题...">
-    <button onclick="ask()">提问</button>
+    <button id="askBtn" onclick="ask()">提问</button>
+    <button id="stop" onclick="stopAsk()" disabled>停止</button>
+
     <h3>回答：</h3>
+    <div id="status"></div>
     <div id="answer">等待提问...</div>
 
     <script>
+        // ===== 后端接口地址 =====
+        // 页面由 FastAPI 托管时用同源相对路径；
+        // 如果是双击本地文件打开（file://），退回 8000 端口。
+        const API_URL = (location.protocol === 'file:')
+            ? 'http://127.0.0.1:8000/chat_stream'
+            : '/chat_stream';
+
+        let controller = null;   // 当前请求的 AbortController，用于“停止”
+
+        // ===== SSE 单帧解析 =====
+        // 期望后端格式（改好之后）：
+        //   event: token\ndata: 文本\n\n
+        //   event: done\ndata: \n\n
+        //   event: error\ndata: 错误信息\n\n
+        //   event: retry / truncated 同理
+        // 兼容旧后端：没有任何 event:/data: 前缀的裸文本，按 token 处理。
+        function parseFrame(frame) {
+            if (!frame) return null;
+            if (!frame.trim()) return null;
+
+            let event = null;
+            const dataLines = [];
+            for (const line of frame.split('\n')) {
+                if (line.startsWith('event:')) {
+                    event = line.slice(6).trim();
+                } else if (line.startsWith('data:')) {
+                    // 规范规定 "data:" 后若有一个空格要去掉
+                    dataLines.push(line.slice(5).replace(/^ /, ''));
+                } else if (line.startsWith(':')) {
+                    continue;            // 注释行 / 心跳，忽略
+                }
+            }
+
+            if (event === null && dataLines.length === 0) {
+                // 全是 ':' 开头的行 = SSE 心跳/注释，直接丢弃
+                const lines = frame.split('\n').filter(l => l.trim() !== '');
+                if (lines.every(l => l.startsWith(':'))) return null;
+                return { event: 'token', data: frame };   // 裸文本兜底
+            }
+            // 后端把换行转义成多个 data: 行，这里按 '\n' 还原
+            return { event: event || 'message', data: dataLines.join('\n') };
+        }
+
+        // ===== 停止当前提问 =====
+        function stopAsk() {
+            if (controller) controller.abort();
+        }
+
+        // ===== 主流程 =====
         async function ask() {
-            const q = document.getElementById('question').value;
-            const answerDiv = document.getElementById('answer');
-            answerDiv.innerText = "正在检索法条并思考中...";
+            const input    = document.getElementById('question');
+            const answerEl = document.getElementById('answer');
+            const statusEl = document.getElementById('status');
+            const askBtn   = document.getElementById('askBtn');
+            const stopBtn  = document.getElementById('stop');
 
-            // 注意这里的 URL，如果是 FastAPI 托管，写相对路径 '/chat_stream' 即可
-            const response = await fetch('http://127.0.0.1:8000/chat_stream', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ question: q })
-            });
+            const q = input.value.trim();
+            if (!q) {
+                statusEl.className = 'error';
+                statusEl.textContent = '请先输入问题';
+                return;
+            }
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder('utf-8');
-            answerDiv.innerText = ""; 
+            // 上一个请求还在跑的话先取消
+            if (controller) controller.abort();
+            const myController = new AbortController();
+            controller = myController;
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                const text = decoder.decode(value, { stream: true });
-                answerDiv.innerText += text;
+            answerEl.textContent = '';
+            statusEl.className = '';
+            statusEl.textContent = '正在检索法条并思考中...';
+            askBtn.disabled = true;
+            stopBtn.disabled = false;
+
+            let gotToken = false;
+
+            // 收到一帧就处理一帧
+            function handle(event, data) {
+                switch (event) {
+                    case 'token':
+                        if (data) {
+                            answerEl.textContent += data;
+                            gotToken = true;
+                            statusEl.textContent = '';
+                        }
+                        break;
+                    case 'done':
+                        statusEl.textContent = gotToken ? '完成' : '模型没有返回内容';
+                        break;
+                    case 'retry':
+                        statusEl.textContent = data || '连接中断，正在重试...';
+                        break;
+                    case 'truncated':
+                        statusEl.textContent = data || '输出中断，以上为已生成内容';
+                        break;
+                    case 'error':
+                        statusEl.className = 'error';
+                        statusEl.textContent = '出错了：' + (data || '未知错误');
+                        break;
+                    default:
+                        // 未知事件：有内容就追加，保证不吞字
+                        if (data) { answerEl.textContent += data; gotToken = true; }
+                }
+            }
+
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question: q }),
+                    signal: myController.signal
+                });
+
+                if (!response.ok) {
+                    statusEl.className = 'error';
+                    statusEl.textContent = `请求失败：HTTP ${response.status}`;
+                    return;
+                }
+                if (!response.body) {
+                    statusEl.className = 'error';
+                    statusEl.textContent = '当前浏览器不支持流式读取';
+                    return;
+                }
+
+                const reader  = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buf  = '';
+                let mode = null;   // 'sse' | 'raw'，由第一批数据自动判断
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buf += decoder.decode(value, { stream: true });
+
+                    // 自动判断后端是 SSE 还是裸文本：
+                    // SSE 帧一定以 "event: " 或 "data: " 开头
+                    if (mode === null && buf.length >= 7) {
+                        mode = /^(event|data): /.test(buf) ? 'sse' : 'raw';
+                    }
+
+                    if (mode === 'sse') {
+                        // 按空行切帧；不完整的尾巴留在 buf 里
+                        let idx;
+                        while ((idx = buf.indexOf('\n\n')) !== -1) {
+                            const frame = buf.slice(0, idx);
+                            buf = buf.slice(idx + 2);
+                            const ev = parseFrame(frame);
+                            if (ev) handle(ev.event, ev.data);
+                        }
+                    } else if (mode === 'raw') {
+                        // 裸文本：没有帧边界，收到就显示
+                        if (buf) {
+                            answerEl.textContent += buf;
+                            gotToken = true;
+                            statusEl.textContent = '';
+                            buf = '';
+                        }
+                    }
+                }
+
+                // 流结束：处理残留（最后一段可能没有结尾空行）
+                if (buf) {
+                    const ev = parseFrame(buf);
+                    if (ev) handle(ev.event, ev.data);
+                    buf = '';
+                }
+                if (mode === null) {
+                    // 全程数据不足 7 个字符，没来得及判断模式，按裸文本兜底
+                    statusEl.textContent = gotToken ? '完成' : '模型没有返回内容';
+                }
+
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    statusEl.className = '';
+                    statusEl.textContent = '已停止';
+                } else {
+                    statusEl.className = 'error';
+                    statusEl.textContent = '网络或解析错误：' + err.message;
+                }
+            } finally {
+                // 只清理属于本次请求的状态，避免把新请求的按钮状态改回去
+                if (controller === myController) {
+                    controller = null;
+                    askBtn.disabled = false;
+                    stopBtn.disabled = true;
+                }
             }
         }
+
+        // 回车直接提问
+        document.getElementById('question').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.isComposing) ask();
+        });
     </script>
 </body>
 </html>
